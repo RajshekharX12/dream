@@ -1,4 +1,4 @@
-telethon==1.36.0
+aiogram==3.7.0
 python-dotenv==1.0.1
 ffmpeg-python==0.2.0
 
@@ -10,7 +10,7 @@ transformers==4.44.2
 sentencepiece==0.2.0
 sacremoses==0.1.1
 
-# Voice cloning TTS (XTTS v2)
+# Cross-lingual voice cloning (XTTS v2)
 TTS==0.20.3
 torch==2.3.1
 torchaudio==2.3.1
