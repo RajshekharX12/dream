@@ -1,10 +1,8 @@
 import asyncio
 import os
-import math
 import json
 import subprocess
 import shutil
-import time
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple
 
@@ -19,43 +17,44 @@ from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, FSInputFile, BotCommand
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# ---------- CONFIG ----------
+# -------------------- CONFIG --------------------
 load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 USE_CUDA = os.environ.get("USE_CUDA", "true").lower() == "true"
 MAX_DURATION_MIN = int(os.environ.get("MAX_DURATION_MIN", 20))
 ASR_MODEL_ENV = os.environ.get("ASR_MODEL", "large-v3")
-ADMIN_IDS = set(int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit())
+ADMIN_IDS = set(
+    int(x.strip()) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+)
 TARGET_MAX_MB = int(os.environ.get("TARGET_MAX_MB", 1900))
 COMPRESS_CRF = int(os.environ.get("COMPRESS_CRF", 27))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN missing. Put it in .env")
 
-# ---------- GLOBALS ----------
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# Per-user runtime config + job tracking
+# -------------------- STATE --------------------
 @dataclass
 class SessionState:
-    mode: str = "clone"         # clone | simple
-    out: str = "video"          # video | audio | srt
-    bgmix: bool = True          # keep original ambience mixed low
-    compress: bool = False      # user-chosen compress toggle
+    mode: str = "clone"           # clone | simple
+    out: str = "video"            # video | audio | srt
+    bgmix: bool = True            # keep original ambience at low volume
+    compress: bool = False        # user-chosen extra compression
     asr_model: str = ASR_MODEL_ENV  # base | small | large-v3
-    lang: str = "en"            # en | auto
-    clean_audio: bool = True    # loudnorm + denoise
+    lang: str = "en"              # en | auto
+    clean_audio: bool = True      # loudnorm + denoise
     running_task: Optional[asyncio.Task] = None
     status_msg_id: Optional[int] = None
 
 SESSIONS: Dict[int, SessionState] = {}
 
-# ---------- UTIL: LOGGING ----------
+# -------------------- LOG --------------------
 def log(msg: str):
     print(f"[tele-hindi-dubber] {msg}", flush=True)
 
-# ---------- UTIL: FILES ----------
+# -------------------- FILES --------------------
 def ensure_dir(path: str):
     os.makedirs(path, exist_ok=True)
 
@@ -68,7 +67,7 @@ def clean_dir(path: str):
     if os.path.isdir(path):
         shutil.rmtree(path, ignore_errors=True)
 
-# ---------- UTIL: FFMPEG ----------
+# -------------------- FFMPEG --------------------
 class FFmpegError(RuntimeError):
     pass
 
@@ -79,14 +78,11 @@ def run_ffmpeg(args: List[str], timeout: Optional[int] = None):
         raise FFmpegError(proc.stderr.decode("utf-8", errors="ignore"))
 
 def run_ffprobe_get_duration(path: str) -> float:
-    cmd = [
-        "ffprobe","-v","error","-select_streams","v:0","-show_entries",
-        "format=duration","-of","json", path
-    ]
-    out = subprocess.check_output(cmd)
+    out = subprocess.check_output(
+        ["ffprobe","-v","error","-select_streams","v:0","-show_entries","format=duration","-of","json", path]
+    )
     data = json.loads(out.decode("utf-8"))
-    dur = float(data["format"]["duration"])
-    return max(0.0, dur)
+    return max(0.0, float(data["format"]["duration"]))
 
 def extract_audio_wav(video_path: str, out_wav: str, sr: int = 16000, mono: bool = True) -> str:
     args = ["-y", "-i", video_path]
@@ -101,7 +97,6 @@ def ffmpeg_extract(in_wav: str, out_wav: str, start: float, end: float):
     run_ffmpeg(["-y", "-ss", f"{start}", "-t", f"{duration}", "-i", in_wav, out_wav])
 
 def mux_replace_audio(video_path: str, new_audio_wav: str, out_video: str, crf: Optional[int] = None) -> str:
-    # If crf is None, copy video stream; else re-encode for size control
     if crf is None:
         args = [
             "-y","-i", video_path,"-i", new_audio_wav,
@@ -118,12 +113,10 @@ def mux_replace_audio(video_path: str, new_audio_wav: str, out_video: str, crf: 
     run_ffmpeg(args)
     return out_video
 
-def postprocess_audio_inplace(wav_in: str, clean_audio: bool):
-    """Optional loudness normalize + simple denoise via ffmpeg filters."""
+def postprocess_audio_inplace(wav_in: str, clean_audio: bool) -> str:
     if not clean_audio:
         return wav_in
     tmp = wav_in + ".tmp.wav"
-    # loudnorm + afftdn (denoise)
     run_ffmpeg([
         "-y","-i", wav_in,
         "-af","loudnorm=I=-16:TP=-1.5:LRA=11,afftdn=nr=10:nf=-20",
@@ -136,7 +129,6 @@ def ensure_size_limit(path: str, target_mb: int, crf: int) -> str:
     size_mb = os.path.getsize(path) / (1024*1024)
     if size_mb <= target_mb:
         return path
-    # re-encode to attempt shrinking
     out2 = path.replace(".mp4", f".crf{crf}.mp4")
     run_ffmpeg([
         "-y","-i", path,
@@ -146,7 +138,7 @@ def ensure_size_limit(path: str, target_mb: int, crf: int) -> str:
     ])
     return out2
 
-# ---------- ASR: faster-whisper ----------
+# -------------------- ASR --------------------
 from faster_whisper import WhisperModel
 import torch
 
@@ -179,10 +171,9 @@ def transcribe_segments(wav_path: str, model_name: str, lang: str) -> List[Dict]
         out.append({"start": float(s.start), "end": float(s.end), "text": s.text.strip()})
     return out
 
-# ---------- Translation: HF pipeline (en->hi) ----------
+# -------------------- Translation --------------------
 from transformers import pipeline as hf_pipeline
 _TRANSLATOR = None
-
 def get_translator():
     global _TRANSLATOR
     if _TRANSLATOR is None:
@@ -203,14 +194,14 @@ def translate_segments_en_hi(segments: List[Dict]) -> List[Dict]:
         out.append(x)
     return out
 
-# ---------- TTS Voice Clone: Coqui XTTS-v2 ----------
+# -------------------- TTS / Voice Cloning --------------------
 from TTS.api import TTS
 
 class VoiceCloner:
     def __init__(self):
         gpu = bool(USE_CUDA and torch.cuda.is_available())
         self.tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2", gpu=gpu)
-        self.sample_rate = 24000  # XTTS default
+        self.sample_rate = 24000
 
     def synth(self, text_hi: str, ref_wav: Optional[str], simple: bool=False) -> np.ndarray:
         if simple:
@@ -229,7 +220,7 @@ class VoiceCloner:
         stretched = librosa.effects.time_stretch(wav, rate)
         return stretched.astype(np.float32), self.sample_rate
 
-# ---------- Compose Dubbed Track ----------
+# -------------------- Compose Dubbed Track --------------------
 def compose_dubbed_track(
     original_wav: str,
     segments_hi: List[Dict],
@@ -261,7 +252,6 @@ def compose_dubbed_track(
             dubbed = np.concatenate([dubbed, np.zeros(pad, dtype=np.float32)])
         dubbed[start_idx:end_idx] += wav
 
-    # mix low-level ambience if requested
     if keep_bg:
         if sr_orig != sr:
             y_res = librosa.resample(y_orig.astype(np.float32), orig_sr=sr_orig, target_sr=sr)
@@ -279,7 +269,7 @@ def compose_dubbed_track(
     sf.write(out_wav, dubbed, sr)
     return out_wav, sr
 
-# ---------- SRT writer ----------
+# -------------------- SRT --------------------
 def write_srt(segments_hi: List[Dict], out_path: str):
     def fmt_time(t: float) -> str:
         h = int(t // 3600); t -= h*3600
@@ -294,7 +284,7 @@ def write_srt(segments_hi: List[Dict], out_path: str):
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
 
-# ---------- UI (inline keyboard) ----------
+# -------------------- UI --------------------
 def build_kb(st: SessionState):
     kb = InlineKeyboardBuilder()
     kb.button(text=("🎭 Clone Voice" if st.mode=="clone" else "🗣️ Simple Hindi"), callback_data="mode:toggle")
@@ -323,13 +313,13 @@ async def update_status(m: Message, st: SessionState, text: str):
     except Exception:
         pass
 
-# ---------- ACCESS CONTROL ----------
+# -------------------- ACCESS --------------------
 def allowed_user(user_id: int) -> bool:
     if not ADMIN_IDS:
         return True
     return user_id in ADMIN_IDS
 
-# ---------- STARTUP ----------
+# -------------------- STARTUP --------------------
 @dp.startup.register
 async def on_startup():
     await bot.set_my_commands([
@@ -339,7 +329,7 @@ async def on_startup():
         BotCommand(command="ping", description="Ping / system info"),
     ])
 
-# ---------- HANDLERS ----------
+# -------------------- HANDLERS --------------------
 @dp.message(CommandStart())
 async def start_cmd(m: Message):
     if not allowed_user(m.from_user.id):
@@ -356,6 +346,7 @@ async def start_cmd(m: Message):
 
 @dp.message(Command("ping"))
 async def ping_cmd(m: Message):
+    import torch
     gpu = torch.cuda.is_available()
     cpu_count = os.cpu_count()
     mem = psutil.virtual_memory()
@@ -385,7 +376,6 @@ async def cancel_cmd(m: Message):
     else:
         await m.answer("No running job to cancel.")
 
-# ---- button callbacks (NOTE: use keyword 'reply_markup=') ----
 @dp.callback_query(F.data.startswith("mode:"))
 async def cb_mode(c: CallbackQuery):
     st = SESSIONS.setdefault(c.from_user.id, SessionState())
@@ -449,7 +439,7 @@ async def cb_cancel(c: CallbackQuery):
     else:
         await c.answer("No job running.")
 
-# Accept video or video document
+# -------------------- VIDEO HANDLER --------------------
 @dp.message(F.video | F.document)
 async def on_video(m: Message):
     if not allowed_user(m.from_user.id):
@@ -458,7 +448,7 @@ async def on_video(m: Message):
 
     st = SESSIONS.setdefault(m.from_user.id, SessionState())
 
-    # Reject too long
+    # Duration guard
     vid_dur = 0
     if m.video:
         vid_dur = m.video.duration or 0
@@ -466,25 +456,20 @@ async def on_video(m: Message):
         await m.reply(f"Video too long. Max {MAX_DURATION_MIN} minutes (set MAX_DURATION_MIN in .env).")
         return
 
-    # Only one job per user
     if st.running_task and not st.running_task.done():
         await m.reply("You already have a running job. Use /cancel to stop it.")
         return
 
-    # Download
     work = user_workdir(m.from_user.id)
     ensure_dir(work)
     in_path = os.path.join(work, "input.mp4")
 
     await update_status(m, st, "⬇️ Downloading video…")
     file_obj = m.video or m.document
-    try:
-        await bot.download(file=file_obj, destination=in_path)  # aiogram >=3.0
-    except Exception:
-        f = await bot.get_file(file_obj.file_id)
-        await bot.download_file(f.file_path, in_path)
+    # Use get_file + download_file for stability across aiogram versions
+    file = await bot.get_file(file_obj.file_id)
+    await bot.download_file(file.file_path, in_path)
 
-    # Spawn processing task
     st.running_task = asyncio.create_task(process_job(m, st, in_path))
     try:
         await st.running_task
@@ -493,7 +478,7 @@ async def on_video(m: Message):
     finally:
         st.running_task = None
 
-# ---------- CORE PIPELINE ----------
+# -------------------- CORE PIPELINE --------------------
 async def process_job(m: Message, st: SessionState, in_path: str):
     work = os.path.dirname(in_path)
     try:
@@ -510,7 +495,6 @@ async def process_job(m: Message, st: SessionState, in_path: str):
         await update_status(m, st, "🌐 Translating to Hindi…")
         segments_hi = await asyncio.to_thread(translate_segments_en_hi, segments)
 
-        # Build reference voice sample (6–8s from first speech)
         s0 = segments[0]
         ref_start = max(0.0, float(s0["start"]))
         ref_dur = max(6.0, min(8.0, float(s0["end"]) - ref_start))
@@ -540,4 +524,9 @@ async def process_job(m: Message, st: SessionState, in_path: str):
             return
 
         if st.out == "srt":
-            await up
+            await update_status(m, st, "🧾 Writing SRT…")
+            srt_path = os.path.join(work, "subtitles_hi.srt")
+            await asyncio.to_thread(write_srt, segments_hi, srt_path)
+            await update_status(m, st, "📤 Sending SRT…")
+            await m.answer_document(FSInputFile(srt_path), caption="Hindi subtitles (.srt)")
+            await finalize_status
