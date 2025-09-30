@@ -463,26 +463,61 @@ async def on_video(m: Message):
         return
 
     work = user_workdir(m.from_user.id)
+    # The clean_dir call was missing here, which is good practice to start fresh
+    await asyncio.to_thread(clean_dir, work) 
     ensure_dir(work)
     in_path = os.path.join(work, "input.mp4")
 
-    await update_status(m, st, "⬇️ Downloading video…")
-    file_obj = m.video or m.document
-    file = await bot.get_file(file_obj.file_id)
-    await bot.download_file(file.file_path, in_path)
+    try:
+        await update_status(m, st, "⬇️ Downloading video…")
+        file_obj = m.video or m.document
+        file = await bot.get_file(file_obj.file_id)
+        await bot.download_file(file.file_path, in_path)
+    except Exception as e:
+        await m.reply(f"❌ Failed to download file: {e}")
+        # Clean up the status message here
+        if st.status_msg_id:
+            await bot.delete_message(m.chat.id, st.status_msg_id)
+            st.status_msg_id = None
+        return
 
+    # Start the core processing task
     st.running_task = asyncio.create_task(process_job(m, st, in_path))
     try:
+        # Wait for the task to complete
         await st.running_task
     except asyncio.CancelledError:
+        # The task was explicitly canceled via the /cancel command or callback
         await update_status(m, st, "❌ Job canceled.")
     finally:
+        # Clear the running task reference regardless of outcome
         st.running_task = None
+        # Clean up the work directory in a background thread
+        await asyncio.to_thread(clean_dir, work)
+
+
+# ==================== STATUS FINALIZE ====================
+async def finalize_status(m: Message, st: SessionState, success: bool = True):
+    """Updates the final status message and optionally deletes it."""
+    try:
+        if st.status_msg_id:
+            text = "✅ Done!" if success else "❌ Error occurred."
+            # Edit the message one last time to show final status
+            await bot.edit_message_text(
+                chat_id=m.chat.id,
+                message_id=st.status_msg_id,
+                text=text,
+            )
+            # Clear the ID so it's not reused for a future job
+            st.status_msg_id = None
+    except Exception:
+        pass # Ignore exceptions on status update
 
 # ==================== CORE PIPELINE ====================
 async def process_job(m: Message, st: SessionState, in_path: str):
     work = os.path.dirname(in_path)
     try:
+        # --- PHASE 1: ASR and Translation ---
         await update_status(m, st, "🎵 Extracting audio…")
         wav16k = os.path.join(work, "original.wav")
         await asyncio.to_thread(extract_audio_wav, in_path, wav16k, 16000, True)
@@ -495,15 +530,29 @@ async def process_job(m: Message, st: SessionState, in_path: str):
 
         await update_status(m, st, "🌐 Translating to Hindi…")
         segments_hi = await asyncio.to_thread(translate_segments_en_hi, segments)
+        
+        # If output is SRT, skip TTS and Muxing
+        if st.out == "srt":
+            await update_status(m, st, "🧾 Writing SRT…")
+            srt_path = os.path.join(work, "subtitles_hi.srt")
+            await asyncio.to_thread(write_srt, segments_hi, srt_path)
+            await update_status(m, st, "📤 Sending SRT…")
+            await m.answer_document(FSInputFile(srt_path), caption="Hindi subtitles (.srt)")
+            await finalize_status(m, st)
+            return
 
+        # --- PHASE 2: Voice Cloning/Synth ---
         s0 = segments[0]
-        ref_start = max(0.0, float(s0["start"]))
-        ref_dur = max(6.0, min(8.0, float(s0["end"]) - ref_start))
+        # Ensure ref_start doesn't go below zero
+        ref_start = max(0.0, float(s0["start"])) 
+        # Corrected duration logic: Min 0.1s, max 8.0s, or the segment's actual duration
+        ref_dur = max(0.1, min(8.0, float(s0["end"]) - ref_start)) 
         ref_path = os.path.join(work, "ref.wav")
         await asyncio.to_thread(ffmpeg_extract, wav16k, ref_path, ref_start, ref_start + ref_dur)
 
         await update_status(m, st, "🗣️ Synthesizing Hindi voice…")
-        cloner = VoiceCloner()
+        # Instantiate cloner inside process_job to ensure it's thread-safe and to handle model loading (XTTS is cached anyway)
+        cloner = VoiceCloner() 
         simple = (st.mode != "clone")
         out_wav, _sr = await asyncio.to_thread(
             compose_dubbed_track,
@@ -518,16 +567,42 @@ async def process_job(m: Message, st: SessionState, in_path: str):
         await update_status(m, st, "🎛️ Post-processing audio…")
         await asyncio.to_thread(postprocess_audio_inplace, out_wav, st.clean_audio)
 
+        # --- PHASE 3: Output Generation ---
         if st.out == "audio":
             await update_status(m, st, "📤 Sending audio…")
-            await m.answer_document(FSInputFile(out_wav), caption="Hindi dub (audio)")
-            await finalize_status(m, st)
-            return
+            audio_path = os.path.join(work, "dubbed.mp3")
+            # Convert final WAV to MP3 for Telegram (better compression)
+            await asyncio.to_thread(run_ffmpeg, ["-y", "-i", out_wav, "-c:a", "libmp3lame", "-b:a", "192k", audio_path])
+            await m.answer_document(FSInputFile(audio_path), caption="Hindi dub (audio)")
+        
+        elif st.out == "video":
+            await update_status(m, st, "📼 Muxing audio to video…")
+            muxed_path = os.path.join(work, "dubbed_mux.mp4")
+            
+            crf_val = COMPRESS_CRF if st.compress else None
+            # Mux/re-encode
+            await asyncio.to_thread(mux_replace_audio, in_path, out_wav, muxed_path, crf=crf_val)
 
-        if st.out == "srt":
-            await update_status(m, st, "🧾 Writing SRT…")
-            srt_path = os.path.join(work, "subtitles_hi.srt")
-            await asyncio.to_thread(write_srt, segments_hi, srt_path)
-            await update_status(m, st, "📤 Sending SRT…")
-            await m.answer_document(FSInputFile(srt_path), caption="Hindi subtitles (.srt)")
-          
+            # Ensure file size limit
+            if not st.compress:
+                await update_status(m, st, f"📏 Checking size limit (<{TARGET_MAX_MB}MB)…")
+                muxed_path = await asyncio.to_thread(ensure_size_limit, muxed_path, TARGET_MAX_MB, COMPRESS_CRF)
+
+            await update_status(m, st, "📤 Sending video…")
+            # Using answer_video to ensure it's displayed nicely
+            await m.answer_video(FSInputFile(muxed_path), caption="Hindi dub (video)")
+
+        await finalize_status(m, st) # Successful completion
+        
+    except FFmpegError as e:
+        log(f"FFmpeg Error: {e}")
+        await update_status(m, st, f"❌ FFmpeg Error: An error occurred during file processing.")
+        await m.answer(f"**FFmpeg Error:**\n\n`{e.args[0][:400]}...`", parse_mode="Markdown")
+        await finalize_status(m, st, success=False)
+    except Exception as e:
+        import traceback
+        log(f"Unhandled Error: {traceback.format_exc()}")
+        await update_status(m, st, f"❌ An unexpected error occurred: {type(e).__name__}")
+        await m.answer(f"**Error:** {e}")
+        await finalize_status(m, st, success=False)
+
