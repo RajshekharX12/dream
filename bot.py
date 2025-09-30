@@ -1,4 +1,3 @@
-cat > bot.py <<'PY'
 import asyncio
 import os
 import json
