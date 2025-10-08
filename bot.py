@@ -43,7 +43,7 @@ except Exception:  # pragma: no cover
 # -----------------------
 # Config & Logging
 # -----------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+BOT_TOKEN = os.getenv("8287015753:AAGoGYF_u6-OqfrqGF1_xPY8yIW5FiD9MtE", "").strip()
 if not BOT_TOKEN:
     raise SystemExit("Please set BOT_TOKEN:  export BOT_TOKEN=123456:ABCDEF")
 
