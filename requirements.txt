@@ -1,0 +1,7 @@
+aiogram>=3.7.0
+python-dotenv
+matplotlib
+pandas
+pdfplumber
+SafoneAPI
+uvloop
